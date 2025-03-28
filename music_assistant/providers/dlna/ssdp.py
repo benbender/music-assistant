@@ -59,7 +59,7 @@ class SsdpServiceInfo:
     ssdp_all_locations: set[str] = field(default_factory=set)
 
 
-DiscoverCallback = Callable[[SsdpServiceInfo], Coroutine[Any, Any, None]]
+DiscoverCallback = Callable[[SsdpServiceInfo, SsdpSource], Coroutine[Any, Any, None]]
 
 
 class SSDPScanner:
@@ -134,10 +134,7 @@ class SSDPScanner:
             if not _is_dmr_device(discovery_info) or _is_sonos_device(discovery_info):
                 return
 
-            if ssdp_source == SsdpSource.SEARCH_CHANGED:
-                await self._discover_callback(discovery_info)
-            else:
-                _LOGGER.info("device alive %s", discovery_info.ssdp_location)
+            await self._discover_callback(discovery_info, ssdp_source)
 
     async def _async_get_description_dict(self, location: str | None) -> Mapping[str, str]:
         """Get description dict."""

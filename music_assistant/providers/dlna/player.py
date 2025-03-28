@@ -5,8 +5,9 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Mapping
 from contextlib import suppress
+from datetime import datetime
 from time import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from async_upnp_client.device_updater import DeviceUpdater
 from async_upnp_client.exceptions import UpnpError, UpnpResponseError
@@ -105,6 +106,7 @@ class DLNAPlayer:
         self._device_lock = asyncio.Lock()
         self.upnp_factory = upnp_factory
         self.event_handler = event_handler
+        self.last_seen_at = datetime.now()
 
         self.mass_player = Player(
             player_id=discovery_info.ssdp_udn,
@@ -119,7 +121,7 @@ class DLNAPlayer:
     async def async_connect(self, location: str) -> None:
         """Connect the player and subscribe to events."""
         async with self._device_lock:
-            self.logger.info("Connecting player %s", self.player_id)
+            self.logger.info("Connecting to player")
 
             # Connect to the base UPNP device
             upnp_device = await self.upnp_factory.async_create_device(location)
@@ -176,16 +178,12 @@ class DLNAPlayer:
                 self.logger.info("Disconnecting from device that's not connected")
                 return
 
-            self.logger.info("Disconnecting from %s", self.dmr_device.name)
-
+            # if mass is currently streaming to a device,
+            # we want to stop that stream to avoid hickups on shutdown
             if (
                 stop_streams
                 and self.mass_player.state == PlayerState.PLAYING
-                and (
-                    self.mass_player.current_item_id
-                    and self.player_id in self.mass_player.current_item_id
-                )
-                and self.dmr_device
+                and self._is_mass_stream()
                 and self.dmr_device.can_stop
             ):
                 with suppress(RuntimeError):
@@ -203,12 +201,6 @@ class DLNAPlayer:
         :param do_ping: Poll device to check if it is available (online).
         """
         self.logger.debug("Updating player")
-
-        if not self.dmr_device:
-            try:
-                await self.async_connect(self.location)
-            except UpnpError:
-                return
 
         assert self.dmr_device is not None
 
@@ -229,11 +221,6 @@ class DLNAPlayer:
         return self.mass_player.player_id
 
     @property
-    def name(self) -> str:
-        """Player name."""
-        return self.mass_player.name
-
-    @property
     def available(self) -> bool:
         """Device is available when we have a connection to it."""
         return self.dmr_device is not None and self.dmr_device.profile_device.available
@@ -241,7 +228,7 @@ class DLNAPlayer:
     def _handle_event(  # noqa: PLR0915
         self,
         service: UpnpService,
-        state_variables: Sequence[UpnpStateVariable],
+        state_variables: Sequence[UpnpStateVariable[Any]],
     ) -> None:
         """Handle state variable(s) changed event from DLNA device."""
         if not state_variables:
@@ -262,9 +249,10 @@ class DLNAPlayer:
                     for item in split_commas(state_variable.value):
                         if "audio/flac" in item.lower():
                             self.supports_flac = True
+                            self.logger.debug("Player supports flac")
                             break
-
-                    self.logger.info("Player supports_flac %s", self.supports_flac)
+                    else:
+                        self.logger.debug("Player does not support flac")
 
         elif service.service_id == "urn:upnp-org:serviceId:RenderingControl":
             for state_variable in state_variables:
@@ -321,10 +309,7 @@ class DLNAPlayer:
                 elif state_variable.name == "PlaybackStorageMedium":
                     active_source = None
 
-                    if (
-                        self.mass_player.current_item_id
-                        and self.player_id in self.mass_player.current_item_id
-                    ):
+                    if self._is_mass_stream():
                         active_source = self.player_id
 
                     elif state_variable.value:
@@ -410,11 +395,17 @@ class DLNAPlayer:
         ):
             service = self.dmr_device.device.service("urn:schemas-upnp-org:service:AVTransport:1")
             if not service:
+                self.logger.error(
+                    "Does not provide the AVTransport-service. Can't fetch current position."
+                )
                 return
 
             action = service.action("GetPositionInfo")
 
             if not action:
+                self.logger.error(
+                    "Does not provide the GetPositionInfo-action. Can't fetch current position."
+                )
                 return
 
             result = await action.async_call(InstanceID=0)
@@ -423,7 +414,7 @@ class DLNAPlayer:
             # shouldn't harm otherwise.
             elapsed_time = str_to_time(result["RelTime"].replace("-", ""))
             if elapsed_time is None:
-                self.logger.error("borked RelTime %s", result["RelTime"])
+                self.logger.error("Broken RelTime-value: %s", result["RelTime"])
                 return
 
             # only update elapsed_time if the device actually reports it
@@ -458,6 +449,11 @@ class DLNAPlayer:
             supported_features.add(PlayerFeature.NEXT_PREVIOUS)
 
         self.mass_player.supported_features = supported_features
+
+    def _is_mass_stream(self) -> bool:
+        return bool(
+            self.mass_player.current_item_id and self.player_id in self.mass_player.current_item_id
+        )
 
 
 # def datetime_from_utc_to_local(utc_datetime: datetime) -> datetime:

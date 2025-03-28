@@ -5,11 +5,12 @@ from __future__ import annotations
 import asyncio
 import functools
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Concatenate, ParamSpec, TypeVar
 
 from async_upnp_client.aiohttp import AiohttpSessionRequester
 from async_upnp_client.client_factory import UpnpFactory
+from async_upnp_client.const import SsdpSource
 from async_upnp_client.exceptions import UpnpError
 
 from music_assistant.constants import (
@@ -125,8 +126,6 @@ class DLNAPlayerProvider(PlayerProvider):
 
         Called when provider is deregistered (e.g. MA exiting or config reloading).
         """
-        # if mass is currently streaming to a device,
-        # we want to stop that stream to avoid hickups on shutdown
         await asyncio.gather(
             *(player.async_disconnect(True) for player in self.dlnaplayers.values())
         )
@@ -299,27 +298,36 @@ class DLNAPlayerProvider(PlayerProvider):
         # reschedule self once finished
         self.mass.loop.call_later(600, reschedule)
 
-    async def _player_discovered(self, discovery_info: SsdpServiceInfo) -> None:
+    async def _player_discovered(
+        self, discovery_info: SsdpServiceInfo, ssdp_source: SsdpSource
+    ) -> None:
         """Handle discovered DLNA player."""
-        async with self.lock:
-            # if multiple locations are given for the player, prefer ipv4 because
-            # of broken ipv6-stacks out there. If only v6 is available, use it though.
-            description_url = get_preferred_location(discovery_info.ssdp_all_locations)
+        if ssdp_source == SsdpSource.SEARCH_CHANGED:
+            async with self.lock:
+                # if multiple locations are given for the player, prefer ipv4 because
+                # of broken ipv6-stacks out there. If only v6 is available, use it though.
+                description_url = get_preferred_location(discovery_info.ssdp_all_locations)
 
-            # new player detected, setup our DLNAPlayer wrapper
-            conf_key = f"{CONF_PLAYERS}/{discovery_info.ssdp_udn}/enabled"
-            enabled = self.mass.config.get(conf_key, True)
+                # new player detected, setup our DLNAPlayer wrapper
+                conf_key = f"{CONF_PLAYERS}/{discovery_info.ssdp_udn}/enabled"
+                enabled = self.mass.config.get(conf_key, True)
 
-            # ignore disabled players
-            if not enabled:
-                self.logger.debug("Ignoring disabled player: %s", discovery_info.ssdp_udn)
-                return
+                # ignore disabled players
+                if not enabled:
+                    self.logger.debug("Ignoring disabled player: %s", discovery_info.ssdp_udn)
+                    return
 
-            self.dlnaplayers[discovery_info.ssdp_udn] = DLNAPlayer(
-                self,
-                discovery_info,
-                self.upnp_factory,
-                self.notify_handler.event_handler,
-            )
+                self.dlnaplayers[discovery_info.ssdp_udn] = DLNAPlayer(
+                    self,
+                    discovery_info,
+                    self.upnp_factory,
+                    self.notify_handler.event_handler,
+                )
 
-            await self.dlnaplayers[discovery_info.ssdp_udn].async_connect(description_url)
+                await self.dlnaplayers[discovery_info.ssdp_udn].async_connect(description_url)
+        elif ssdp_source == SsdpSource.SEARCH_ALIVE and discovery_info.ssdp_udn in self.dlnaplayers:
+            dlna_player = self.dlnaplayers[discovery_info.ssdp_udn]
+
+            dlna_player.last_seen_at = datetime.now()
+
+            self.logger.debug("Player alive at %s", discovery_info.ssdp_location)
