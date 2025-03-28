@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 from collections.abc import Mapping
 from contextlib import suppress
 from time import time
@@ -30,8 +29,7 @@ if TYPE_CHECKING:
     from async_upnp_client.client import UpnpEventHandler, UpnpService, UpnpStateVariable
     from async_upnp_client.client_factory import UpnpFactory
 
-    from music_assistant import MusicAssistant
-
+    from .provider import DLNAPlayerProvider
     from .ssdp import SsdpServiceInfo
 
 
@@ -72,8 +70,6 @@ _TRANSPORT_STATE_TO_MEDIA_PLAYER_STATE: Mapping[TransportState, PlayerState] = {
     TransportState.RECORDING: PlayerState.IDLE,
 }
 
-_LOGGER = logging.getLogger(__name__)
-
 
 class DLNAPlayer:
     """Class that holds all dlna variables for a player."""
@@ -97,21 +93,22 @@ class DLNAPlayer:
 
     def __init__(
         self,
-        mass: MusicAssistant,
-        instance_id: str,
+        provider: DLNAPlayerProvider,
         discovery_info: SsdpServiceInfo,
         upnp_factory: UpnpFactory,
         event_handler: UpnpEventHandler,
     ) -> None:
         """Init."""
-        self.mass = mass
+        self.provider = provider
+        self.mass = provider.mass
+        self.logger = self.provider.logger.getChild(discovery_info.ssdp_udn)
         self._device_lock = asyncio.Lock()
         self.upnp_factory = upnp_factory
         self.event_handler = event_handler
 
         self.mass_player = Player(
             player_id=discovery_info.ssdp_udn,
-            provider=instance_id,
+            provider=provider.instance_id,
             type=PlayerType.PLAYER,
             name=discovery_info.ssdp_udn,
             available=False,
@@ -122,7 +119,7 @@ class DLNAPlayer:
     async def async_connect(self, location: str) -> None:
         """Connect the player and subscribe to events."""
         async with self._device_lock:
-            _LOGGER.info("Connecting player %s", self.player_id)
+            self.logger.info("Connecting player %s", self.player_id)
 
             # Connect to the base UPNP device
             upnp_device = await self.upnp_factory.async_create_device(location)
@@ -149,12 +146,12 @@ class DLNAPlayer:
             except UpnpResponseError as err:
                 # Device rejected subscription request. This is OK, variables
                 # will be polled instead.
-                _LOGGER.info("Device rejected subscription: %r", err)
+                self.logger.info("Device rejected subscription: %r", err)
             except UpnpError as err:
                 # Don't leave the device half-constructed
                 self.dmr_device.on_event = None
                 # dlna_player.device = None
-                _LOGGER.info("Error while subscribing during device connect: %r", err)
+                self.logger.info("Error while subscribing during device connect: %r", err)
                 raise
 
             self.mass_player.available = self.dmr_device.device.available
@@ -172,14 +169,14 @@ class DLNAPlayer:
 
         Also call when removing this entity from MA to clean up connections.
         """
-        _LOGGER.info("Disonnecting player %s", self.player_id)
+        self.logger.info("Disonnecting player %s", self.player_id)
 
         async with self._device_lock:
             if not self.dmr_device:
-                _LOGGER.info("Disconnecting from device that's not connected")
+                self.logger.info("Disconnecting from device that's not connected")
                 return
 
-            _LOGGER.info("Disconnecting from %s", self.dmr_device.name)
+            self.logger.info("Disconnecting from %s", self.dmr_device.name)
 
             if (
                 stop_streams
@@ -205,7 +202,7 @@ class DLNAPlayer:
 
         :param do_ping: Poll device to check if it is available (online).
         """
-        _LOGGER.info("async_update %s", self.player_id)
+        self.logger.debug("Updating player")
 
         if not self.dmr_device:
             try:
@@ -218,7 +215,7 @@ class DLNAPlayer:
         try:
             await self.dmr_device.async_update(do_ping=self.check_available or do_ping)
         except UpnpError as err:
-            _LOGGER.debug("Device unavailable: %r", err)
+            self.logger.debug("Device unavailable: %r", err)
             await self.async_disconnect()
             return
         finally:
@@ -267,7 +264,7 @@ class DLNAPlayer:
                             self.supports_flac = True
                             break
 
-                    _LOGGER.info("SinkProtocolInfo supports_flac %s", self.supports_flac)
+                    self.logger.info("Player supports_flac %s", self.supports_flac)
 
         elif service.service_id == "urn:upnp-org:serviceId:RenderingControl":
             for state_variable in state_variables:
@@ -317,7 +314,7 @@ class DLNAPlayer:
                     #                 )
                     #             )
 
-                    #     # _LOGGER.warning("self._sources %s", self._sources)
+                    #     # self.logger.warning("self._sources %s", self._sources)
 
                     _refresh_player = True
 
@@ -369,7 +366,7 @@ class DLNAPlayer:
                         self.mass.loop.create_task(self._update_current_position())
                         _refresh_player = True
                     else:
-                        _LOGGER.warning(
+                        self.logger.debug(
                             "tried to update media_duration without current_media %s",
                             self.dmr_device.media_duration,
                         )
@@ -426,7 +423,7 @@ class DLNAPlayer:
             # shouldn't harm otherwise.
             elapsed_time = str_to_time(result["RelTime"].replace("-", ""))
             if elapsed_time is None:
-                _LOGGER.error("borked RelTime %s", result["RelTime"])
+                self.logger.error("borked RelTime %s", result["RelTime"])
                 return
 
             # only update elapsed_time if the device actually reports it

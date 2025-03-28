@@ -53,9 +53,6 @@ _R = TypeVar("_R")
 _P = ParamSpec("_P")
 
 
-_LOGGER = logging.getLogger(__name__)
-
-
 def catch_request_errors(
     func: Callable[Concatenate[_DLNAPlayerProviderT, _P], Awaitable[_R]],
 ) -> Callable[Concatenate[_DLNAPlayerProviderT, _P], Coroutine[Any, Any, _R | None]]:
@@ -168,7 +165,7 @@ class DLNAPlayerProvider(PlayerProvider):
         """Poll player for state updates."""
         dlnaplayer = self.dlnaplayers[player_id]
 
-        _LOGGER.info("Polling player %s", dlnaplayer.player_id)
+        self.logger.debug("Polling player %s", dlnaplayer.player_id)
 
     @catch_request_errors
     async def cmd_stop(self, player_id: str) -> None:
@@ -319,8 +316,7 @@ class DLNAPlayerProvider(PlayerProvider):
                 return
 
             self.dlnaplayers[discovery_info.ssdp_udn] = DLNAPlayer(
-                self.mass,
-                self.instance_id,
+                self,
                 discovery_info,
                 self.upnp_factory,
                 self.notify_handler.event_handler,
