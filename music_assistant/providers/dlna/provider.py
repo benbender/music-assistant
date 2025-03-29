@@ -13,7 +13,6 @@ import functools
 import logging
 import time
 from contextlib import suppress
-from ipaddress import IPv4Address
 from typing import TYPE_CHECKING, Any, Concatenate, ParamSpec, TypeVar
 
 from async_upnp_client.aiohttp import AiohttpSessionRequester
@@ -64,8 +63,6 @@ PLAYER_CONFIG_ENTRIES = (
 )
 
 
-CONF_NETWORK_SCAN = "network_scan"
-
 _DLNAPlayerProviderT = TypeVar("_DLNAPlayerProviderT", bound="DLNAPlayerProvider")
 _R = TypeVar("_R")
 _P = ParamSpec("_P")
@@ -111,7 +108,7 @@ def catch_request_errors(
     return wrapper
 
 
-class DLNAPlayerProvider(PlayerProvider):
+class DLNAPlayerProvider(PlayerProvider):  # pylint:disable=abstract-method
     """DLNA Player provider."""
 
     dlnaplayers: dict[str, DLNAPlayer]
@@ -292,7 +289,6 @@ class DLNAPlayerProvider(PlayerProvider):
         try:
             self._discovery_running = True
             self.logger.debug("DLNA discovery started...")
-            allow_network_scan = self.config.get_value(CONF_NETWORK_SCAN)
             discovered_devices: set[str] = set()
 
             async def on_response(discovery_info: CaseInsensitiveDict) -> None:
@@ -323,11 +319,7 @@ class DLNAPlayerProvider(PlayerProvider):
 
                     await self._device_discovered(ssdp_udn, discovery_info["location"])
 
-            # we iterate between using a regular and multicast search (if enabled)
-            if allow_network_scan and use_multicast:
-                await async_search(on_response, target=(str(IPv4Address("255.255.255.255")), 1900))
-            else:
-                await async_search(on_response)
+            await async_search(on_response)
 
         finally:
             self._discovery_running = False
