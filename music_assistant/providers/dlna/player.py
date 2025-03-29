@@ -8,75 +8,125 @@ All rights/credits reserved.
 
 from __future__ import annotations
 
-import asyncio
-import time
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from asyncio import Lock
+from time import time
+from typing import TYPE_CHECKING, Any
 
+from async_upnp_client.exceptions import UpnpError, UpnpResponseError
 from async_upnp_client.profiles.dlna import DmrDevice, TransportState
-from music_assistant_models.enums import PlayerState
+from music_assistant_models.enums import PlayerFeature, PlayerState, PlayerType
+from music_assistant_models.player import DeviceInfo, Player
 
 if TYPE_CHECKING:
-    from music_assistant_models.player import Player
+    from collections.abc import Sequence
+
+    from async_upnp_client.client import (  # type: ignore[attr-defined]
+        UpnpEventHandler,
+        UpnpService,
+        UpnpStateVariable,
+    )
+    from async_upnp_client.client_factory import UpnpFactory
+
+    from .provider import DLNAPlayerProvider
 
 
-@dataclass
 class DLNAPlayer:
     """Class that holds all dlna variables for a player."""
 
     udn: str  # = player_id
-    player: Player  # mass player
-    description_url: str  # last known location (description.xml) url
 
-    device: DmrDevice | None = None
-    lock: asyncio.Lock = field(
-        default_factory=asyncio.Lock
-    )  # Held when connecting or disconnecting the device
+    dmr_device: DmrDevice | None = None
+
     force_poll: bool = False
     ssdp_connect_failed: bool = False
+    check_available: bool = False
+    last_seen: float = time()
 
-    # Track BOOTID in SSDP advertisements for device changes
-    bootid: int | None = None
-    last_seen: float = field(default_factory=time.time)
-    last_command: float = field(default_factory=time.time)
+    _player: Player  # mass player
 
-    def update_attributes(self) -> None:
+    # Held when connecting or disconnecting the device
+    _lock: Lock
+
+    def __init__(
+        self,
+        provider: DLNAPlayerProvider,
+        udn: str,
+        upnp_factory: UpnpFactory,
+        event_handler: UpnpEventHandler,
+    ) -> None:
+        """Initialize the DLNA player."""
+        self.udn = udn
+        self.provider = provider
+        self.logger = self.provider.logger.getChild(self.udn)
+        self._player = Player(
+            player_id=udn,
+            provider=self.provider.instance_id,
+            type=PlayerType.PLAYER,
+            name=udn,
+            available=False,
+            # device info will be discovered later after connect
+            device_info=DeviceInfo(
+                model="unknown",
+                # ip_address=self.description_url,
+                manufacturer="unknown",
+            ),
+            needs_poll=True,
+            poll_interval=30,
+        )
+        self._upnp_factory = upnp_factory
+        self._event_handler = event_handler
+        self._lock = Lock()
+
+    @property
+    def id(self) -> str:
+        """Player id."""
+        return self._player.player_id
+
+    @property
+    def name(self) -> str:
+        """Player name."""
+        return self._player.name
+
+    def _update_attributes(self) -> None:
         """Update attributes of the MA Player from DLNA state."""
         # generic attributes
 
-        assert self.device is not None
+        assert self.dmr_device is not None
 
         if self.available:
-            self.player.available = True
-            self.player.name = self.device.name
-            self.player.volume_level = int((self.device.volume_level or 0) * 100)
-            self.player.volume_muted = self.device.is_volume_muted or False
-            self.player.state = self.get_state(self.device)
-            self.player.current_item_id = self.device.current_track_uri or ""
-            if self.player.player_id in self.player.current_item_id:
-                self.player.active_source = self.player.player_id
-            elif "spotify" in self.player.current_item_id:
-                self.player.active_source = "spotify"
-            elif self.player.current_item_id.startswith("http"):
-                self.player.active_source = "http"
+            self._player.available = True
+            self._player.name = self.dmr_device.name
+            self._player.volume_level = int((self.dmr_device.volume_level or 0) * 100)
+            self._player.volume_muted = self.dmr_device.is_volume_muted or False
+            self._player.state = self.get_state(self.dmr_device)
+            self._player.current_item_id = self.dmr_device.current_track_uri or ""
+
+            if self._player.player_id in self._player.current_item_id:
+                self._player.active_source = self._player.player_id
+            elif "spotify" in self._player.current_item_id:
+                self._player.active_source = "spotify"
+            elif self._player.current_item_id.startswith("http"):
+                self._player.active_source = "http"
             else:
                 # TODO: handle other possible sources here
-                self.player.active_source = None
-            if self.device.media_position:
+                self._player.active_source = None
+
+            if self.dmr_device.media_position:
                 # only update elapsed_time if the device actually reports it
-                self.player.elapsed_time = float(self.device.media_position)
-                if self.device.media_position_updated_at is not None:
-                    self.player.elapsed_time_last_updated = (
-                        self.device.media_position_updated_at.timestamp()
+                self._player.elapsed_time = float(self.dmr_device.media_position)
+
+                if self.dmr_device.media_position_updated_at is not None:
+                    self._player.elapsed_time_last_updated = (
+                        self.dmr_device.media_position_updated_at.timestamp()
                     )
         else:
             # device is unavailable
-            self.player.available = False
+            self._player.available = False
 
     @property
     def available(self) -> bool:
         """Device is available when we have a connection to it."""
-        return self.device is not None and self.device.profile_device.available
+        return self.dmr_device is not None and self.dmr_device.profile_device.available
 
     @staticmethod
     def get_state(device: DmrDevice) -> PlayerState:
@@ -98,3 +148,160 @@ class DLNAPlayer:
             return PlayerState.IDLE
 
         return PlayerState.IDLE
+
+    async def async_connect(self, location: str) -> None:
+        """Connect DLNA/DMR Device."""
+        self.logger.debug("Connecting to device at %s", location)
+
+        async with self._lock:
+            # if dlna_player.description_url == description_url and dlna_player.player.available:
+            #         # nothing to do, device is already connected
+            #         return
+            #     # update description url to newly discovered one
+            #     # dlna_player.description_url = description_url
+
+            if (
+                self.dmr_device
+                and self.dmr_device.device.available
+                and self.dmr_device.device.device_url == location
+            ):
+                self.logger.debug("Trying to connect when device already connected")
+                return
+
+            # Connect to the base UPNP device
+            upnp_device = await self._upnp_factory.async_create_device(location)
+
+            # Create profile wrapper
+            self.dmr_device = DmrDevice(upnp_device, self._event_handler)
+
+            # Subscribe to event notifications
+            try:
+                self.dmr_device.on_event = self._handle_event
+                await self.dmr_device.async_subscribe_services(auto_resubscribe=True)
+
+                self._update_supported_features()
+                self._update_attributes()
+                await self.provider.mass.players.register_or_update(self._player)
+
+            except UpnpResponseError as err:
+                # Device rejected subscription request. This is OK, variables
+                # will be polled instead.
+                self.logger.debug("Device rejected subscription: %r", err)
+            except UpnpError as err:
+                # Don't leave the device half-constructed
+                self.dmr_device.on_event = None
+                self.dmr_device = None
+                self.logger.debug("Error while subscribing during device connect: %r", err)
+                raise
+            else:
+                # connect was successful, update device info
+                self._player.device_info = DeviceInfo(
+                    model=self.dmr_device.model_name,
+                    ip_address=self.dmr_device.device.device_url or location,
+                    manufacturer=self.dmr_device.manufacturer,
+                )
+
+    async def async_disconnect(self) -> None:
+        """
+        Destroy connections to the device now that it's not available.
+
+        Also call when removing this entity from MA to clean up connections.
+        """
+        async with self._lock:
+            if not self.dmr_device:
+                self.logger.debug("Disconnecting from device that's not connected")
+                return
+
+            self.logger.debug("Disconnecting from %s", self.dmr_device.name)
+
+            self.dmr_device.on_event = None
+            old_device = self.dmr_device
+            self.dmr_device = None
+            await old_device.async_unsubscribe_services()
+
+    async def async_update(self, do_ping: bool = False) -> None:
+        """Retrieve the latest data.
+
+        :param do_ping: Poll device to check if it is available (online).
+        """
+        self.logger.debug("Updating player")
+
+        assert self.dmr_device is not None
+
+        try:
+            await self.dmr_device.async_update(do_ping=self.check_available or do_ping)
+        except UpnpError as err:
+            self.logger.debug("Device unavailable: %r", err)
+            await self.async_disconnect()
+            return
+        finally:
+            self.check_available = False
+
+        self._update_supported_features()
+
+    def _handle_event(
+        self,
+        service: UpnpService,
+        state_variables: Sequence[UpnpStateVariable[Any]],
+    ) -> None:
+        """Handle state variable(s) changed event from DLNA device."""
+        if not state_variables:
+            # Indicates a failure to resubscribe, check if device is still available
+            self.force_poll = True
+            return
+
+        if service.service_id == "urn:upnp-org:serviceId:AVTransport":
+            for state_variable in state_variables:
+                # Force a state refresh when player begins or pauses playback
+                # to update the position info.
+                if state_variable.name == "TransportState" and state_variable.value in (
+                    TransportState.PLAYING,
+                    TransportState.PAUSED_PLAYBACK,
+                ):
+                    self.force_poll = True
+                    self.provider.mass.create_task(self.async_update())
+                    self.logger.debug(
+                        "Received new state from event for Player %s: %s",
+                        self._player.display_name,
+                        state_variable.value,
+                    )
+
+        self.provider.mass.create_task(self._update_player())
+
+    async def _update_player(self) -> None:
+        """Update DLNA Player."""
+        prev_url = self._player.current_item_id
+        prev_state = self._player.state
+        self._update_attributes()
+        current_url = self._player.current_item_id
+        current_state = self._player.state
+
+        if (prev_url != current_url) or (prev_state != current_state):
+            # fetch track details on state or url change
+            self.force_poll = True
+
+        # let the MA player manager work out if something actually updated
+        self.provider.mass.players.update(self.udn)
+
+    def _update_supported_features(self) -> None:
+        """Set Player Features based on config values and capabilities."""
+        if not self.dmr_device:
+            return
+
+        # Update supported features
+        supported_features = set[PlayerFeature]()
+
+        if self.dmr_device.has_next_transport_uri:
+            supported_features.add(PlayerFeature.ENQUEUE)
+        if self.dmr_device.has_volume_level:
+            supported_features.add(PlayerFeature.VOLUME_SET)
+        if self.dmr_device.has_volume_mute:
+            supported_features.add(PlayerFeature.VOLUME_MUTE)
+        if self.dmr_device.has_pause:
+            supported_features.add(PlayerFeature.PAUSE)
+        if self.dmr_device.has_seek_abs_time:
+            supported_features.add(PlayerFeature.SEEK)
+        if self.dmr_device.has_next and self.dmr_device.has_previous:
+            supported_features.add(PlayerFeature.NEXT_PREVIOUS)
+
+        self._player.supported_features = supported_features
