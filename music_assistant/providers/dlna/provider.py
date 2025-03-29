@@ -79,7 +79,14 @@ def catch_request_errors(
     @functools.wraps(func)
     async def wrapper(self: _DLNAPlayerProviderT, *args: _P.args, **kwargs: _P.kwargs) -> _R | None:
         """Catch UpnpError errors and check availability before and after request."""
-        player_id = kwargs["player_id"] if "player_id" in kwargs else args[0]
+        player_id = str(kwargs["player_id"] if "player_id" in kwargs else args[0])
+
+        if player_id not in self.dlnaplayers:
+            self.logger.warning(
+                "Device %s unknown when trying to call %s", player_id, func.__name__
+            )
+            return None
+
         dlna_player = self.dlnaplayers[player_id]
         dlna_player.last_command = time.time()
         if self.logger.isEnabledFor(VERBOSE_LOG_LEVEL):
@@ -107,7 +114,7 @@ def catch_request_errors(
 class DLNAPlayerProvider(PlayerProvider):
     """DLNA Player provider."""
 
-    dlnaplayers: dict[str, DLNAPlayer] | None = None
+    dlnaplayers: dict[str, DLNAPlayer]
     _discovery_running: bool = False
 
     lock: asyncio.Lock
@@ -178,6 +185,9 @@ class DLNAPlayerProvider(PlayerProvider):
     async def play_media(self, player_id: str, media: PlayerMedia) -> None:
         """Handle PLAY MEDIA on given player."""
         dlna_player = self.dlnaplayers[player_id]
+
+        assert dlna_player.device is not None
+
         # always clear queue (by sending stop) first
         if dlna_player.device.can_stop:
             await self.cmd_stop(player_id)
@@ -202,6 +212,9 @@ class DLNAPlayerProvider(PlayerProvider):
     async def enqueue_next_media(self, player_id: str, media: PlayerMedia) -> None:
         """Handle enqueuing of the next queue item on the player."""
         dlna_player = self.dlnaplayers[player_id]
+
+        assert dlna_player.device is not None
+
         didl_metadata = create_didl_metadata(media)
         title = media.title or media.uri
         try:
@@ -300,13 +313,15 @@ class DLNAPlayerProvider(PlayerProvider):
                 if ssdp_udn in discovered_devices:
                     # already processed this device
                     return
-                if "rincon" in ssdp_udn.lower():
+
+                if ssdp_udn:
                     # ignore Sonos devices
-                    return
+                    if "rincon" in ssdp_udn.lower():
+                        return
 
-                discovered_devices.add(ssdp_udn)
+                    discovered_devices.add(ssdp_udn)
 
-                await self._device_discovered(ssdp_udn, discovery_info["location"])
+                    await self._device_discovered(ssdp_udn, discovery_info["location"])
 
             # we iterate between using a regular and multicast search (if enabled)
             if allow_network_scan and use_multicast:
@@ -428,7 +443,7 @@ class DLNAPlayerProvider(PlayerProvider):
     def _handle_event(
         self,
         service: UpnpService,
-        state_variables: Sequence[UpnpStateVariable],
+        state_variables: Sequence[UpnpStateVariable[Any]],
     ) -> None:
         """Handle state variable(s) changed event from DLNA device."""
         udn = service.device.udn

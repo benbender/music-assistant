@@ -44,6 +44,8 @@ class DLNAPlayer:
         """Update attributes of the MA Player from DLNA state."""
         # generic attributes
 
+        assert self.device is not None
+
         if self.available:
             self.player.available = True
             self.player.name = self.device.name
