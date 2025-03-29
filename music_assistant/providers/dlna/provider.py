@@ -36,7 +36,7 @@ from music_assistant.helpers.didl_lite import create_didl_metadata
 from music_assistant.helpers.util import TaskManager
 from music_assistant.models.player_provider import PlayerProvider
 
-from .helpers import DLNANotifyServer
+from .notify_handler import DLNANotifyHandler
 from .player import DLNAPlayer
 
 if TYPE_CHECKING:
@@ -112,7 +112,7 @@ class DLNAPlayerProvider(PlayerProvider):  # pylint:disable=abstract-method
     _discovery_running: bool = False
     _lock: Lock
     _upnp_factory: UpnpFactory
-    _notify_server: DLNANotifyServer
+    _notify_handler: DLNANotifyHandler
 
     async def handle_async_init(self) -> None:
         """Handle async initialization of the provider."""
@@ -128,7 +128,13 @@ class DLNAPlayerProvider(PlayerProvider):  # pylint:disable=abstract-method
         requester = AiohttpSessionRequester(self.mass.http_session, with_sleep=True)
 
         self._upnp_factory = UpnpFactory(requester, non_strict=True)
-        self._notify_server = DLNANotifyServer(requester, self.mass)
+        self._notify_handler = DLNANotifyHandler(self.mass, requester)
+
+    async def loaded_in_mass(self) -> None:
+        """Call after the provider has been loaded."""
+        self._notify_handler.register()
+
+        await super().loaded_in_mass()
 
     async def unload(self, is_removed: bool = False) -> None:
         """
@@ -136,7 +142,8 @@ class DLNAPlayerProvider(PlayerProvider):  # pylint:disable=abstract-method
 
         Called when provider is deregistered (e.g. MA exiting or config reloading).
         """
-        self.mass.streams.unregister_dynamic_route("/notify", "NOTIFY")
+        self._notify_handler.unregister()
+
         async with TaskManager(self.mass) as tg:
             for dlna_player in self.dlna_players.values():
                 tg.create_task(dlna_player.async_disconnect())
@@ -334,15 +341,14 @@ class DLNAPlayerProvider(PlayerProvider):  # pylint:disable=abstract-method
                     return
 
                 # new player detected, setup our DLNAPlayer wrapper
-                dlna_player = DLNAPlayer(
+                self.dlna_players[udn] = DLNAPlayer(
                     provider=self,
                     udn=udn,
                     upnp_factory=self._upnp_factory,
-                    event_handler=self._notify_server.event_handler,
+                    event_handler=self._notify_handler.event_handler,
                 )
-                self.dlna_players[udn] = dlna_player
 
-            await dlna_player.async_connect(location)
+            await self.dlna_players[udn].async_connect(location)
 
     def _is_player_disabled(self, udn: str) -> bool:
         conf_key = f"{CONF_PLAYERS}/{udn}/enabled"
