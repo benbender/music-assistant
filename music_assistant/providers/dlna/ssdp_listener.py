@@ -24,6 +24,11 @@ from async_upnp_client.ssdp_listener import (
     SsdpListener as BaseSSDPListener,
 )
 
+ATTR_SSDP_BOOTID = "BOOTID.UPNP.ORG"
+ATTR_SSDP_NEXTBOOTID = "NEXTBOOTID.UPNP.ORG"
+ATTR_SSDP_CONFIGID = "CONFIGID.UPNP.ORG"
+ATTR_SSDP_LOCATION = "ssdp_location"
+
 SSDPEventCallback = Callable[
     [SsdpDevice, DeviceOrServiceType, SsdpSource], Coroutine[Any, Any, None]
 ]

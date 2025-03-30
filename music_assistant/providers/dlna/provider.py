@@ -8,10 +8,10 @@ All rights/credits reserved.
 
 from __future__ import annotations
 
-import functools
 import logging
 from asyncio import Lock
 from datetime import timedelta
+from functools import wraps
 from typing import TYPE_CHECKING, Any, Concatenate, Final, ParamSpec, TypeVar
 
 from async_upnp_client.aiohttp import AiohttpSessionRequester
@@ -23,9 +23,9 @@ from music_assistant.constants import (
     CONF_ENTRY_CROSSFADE_DURATION,
     CONF_ENTRY_CROSSFADE_FLOW_MODE_REQUIRED,
     CONF_ENTRY_ENABLE_ICY_METADATA,
-    CONF_ENTRY_FLOW_MODE_DEFAULT_ENABLED,
     CONF_ENTRY_HTTP_PROFILE,
     CONF_ENTRY_OUTPUT_CODEC,
+    CONF_ENTRY_OUTPUT_CODEC_DEFAULT_MP3,
     CONF_PLAYERS,
     VERBOSE_LOG_LEVEL,
     create_sample_rates_config_entry,
@@ -49,18 +49,6 @@ if TYPE_CHECKING:
 
 SSDP_ST_DMR: Final = "urn:schemas-upnp-org:device:MediaRenderer:1"
 
-PLAYER_CONFIG_ENTRIES: Final = (
-    CONF_ENTRY_CROSSFADE_FLOW_MODE_REQUIRED,
-    CONF_ENTRY_CROSSFADE_DURATION,
-    CONF_ENTRY_OUTPUT_CODEC,
-    CONF_ENTRY_HTTP_PROFILE,
-    CONF_ENTRY_ENABLE_ICY_METADATA,
-    # enable flow mode by default because
-    # most dlna players do not support enqueueing
-    CONF_ENTRY_FLOW_MODE_DEFAULT_ENABLED,
-    create_sample_rates_config_entry(max_sample_rate=192000, max_bit_depth=24),
-)
-
 
 _DLNAPlayerProviderT = TypeVar("_DLNAPlayerProviderT", bound="DLNAPlayerProvider")
 _R = TypeVar("_R")
@@ -72,7 +60,7 @@ def catch_request_errors(
 ) -> Callable[Concatenate[_DLNAPlayerProviderT, _P], Coroutine[Any, Any, _R | None]]:
     """Catch UpnpError errors."""
 
-    @functools.wraps(func)
+    @wraps(func)
     async def wrapper(self: _DLNAPlayerProviderT, *args: _P.args, **kwargs: _P.kwargs) -> _R | None:
         """Catch UpnpError errors and check availability before and after request."""
         player_id = str(kwargs["player_id"] if "player_id" in kwargs else args[0])
@@ -96,7 +84,7 @@ def catch_request_errors(
         try:
             return await func(self, *args, **kwargs)
         except UpnpError as err:
-            dlna_player.force_poll = True
+            # dlna_player.check_available = True
             if self.logger.isEnabledFor(VERBOSE_LOG_LEVEL):
                 self.logger.exception("Error during call %s: %r", func.__name__, err)
             else:
@@ -164,9 +152,20 @@ class DLNAPlayerProvider(PlayerProvider):  # pylint:disable=abstract-method
         player_id: str,
     ) -> tuple[ConfigEntry, ...]:
         """Return all (provider/player specific) Config Entries for the given player (if any)."""
-        base_entries = await super().get_player_config_entries(player_id)
+        config_entries = (
+            *await super().get_player_config_entries(player_id),
+            CONF_ENTRY_CROSSFADE_FLOW_MODE_REQUIRED,
+            CONF_ENTRY_CROSSFADE_DURATION,
+            CONF_ENTRY_OUTPUT_CODEC,
+            CONF_ENTRY_HTTP_PROFILE,
+            CONF_ENTRY_ENABLE_ICY_METADATA,
+            create_sample_rates_config_entry(max_sample_rate=192000, max_bit_depth=24),
+        )
 
-        return base_entries + PLAYER_CONFIG_ENTRIES
+        if player_id in self.dlna_players and self.dlna_players[player_id].supports_flac is False:
+            config_entries += (CONF_ENTRY_OUTPUT_CODEC_DEFAULT_MP3,)
+
+        return config_entries
 
     async def on_player_config_change(
         self,
@@ -180,6 +179,10 @@ class DLNAPlayerProvider(PlayerProvider):  # pylint:disable=abstract-method
         else:
             # run discovery to catch any re-enabled players
             self.mass.create_task(self.discover_players())
+
+    async def poll_player(self, player_id: str) -> None:
+        """Poll player for state updates."""
+        await self._get_dmr_device(player_id).async_update()
 
     @catch_request_errors
     async def cmd_stop(self, player_id: str) -> None:
@@ -315,7 +318,13 @@ class DLNAPlayerProvider(PlayerProvider):  # pylint:disable=abstract-method
         headers = ssdp_device.combined_headers(device_or_service_type)
 
         # connect the device
-        await self.dlna_players[udn].async_connect(location, headers)
+        # we handle reconnects and changed devices internally
+        try:
+            await self.dlna_players[udn].async_connect(location, headers)
+        except RuntimeError as err:
+            self.logger.error(err)
+
+            self.dlna_players.pop(udn, None)
 
     def _is_player_disabled(self, udn: str) -> bool:
         conf_key = f"{CONF_PLAYERS}/{udn}/enabled"
