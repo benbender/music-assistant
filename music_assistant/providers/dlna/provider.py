@@ -10,16 +10,12 @@ from __future__ import annotations
 
 import functools
 import logging
-import time
 from asyncio import Lock
-from contextlib import suppress
-from typing import TYPE_CHECKING, Any, Concatenate, ParamSpec, TypeVar
+from typing import TYPE_CHECKING, Any, Concatenate, Final, ParamSpec, TypeVar
 
 from async_upnp_client.aiohttp import AiohttpSessionRequester
 from async_upnp_client.client_factory import UpnpFactory
 from async_upnp_client.exceptions import UpnpError
-from async_upnp_client.search import async_search
-from music_assistant_models.errors import PlayerUnavailableError
 
 from music_assistant.constants import (
     CONF_ENTRY_CROSSFADE_DURATION,
@@ -38,16 +34,19 @@ from music_assistant.models.player_provider import PlayerProvider
 
 from .notify_handler import DLNANotifyHandler
 from .player import DLNAPlayer
+from .ssdp_listener import SSDPListener, get_preferred_location
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Coroutine
 
-    from async_upnp_client.utils import CaseInsensitiveDict
+    from async_upnp_client.const import DeviceOrServiceType, SsdpSource
+    from async_upnp_client.ssdp_listener import SsdpDevice
     from music_assistant_models.config_entries import ConfigEntry, PlayerConfig
     from music_assistant_models.player import PlayerMedia
 
+SSDP_ST_DMR: Final = "urn:schemas-upnp-org:device:MediaRenderer:1"
 
-PLAYER_CONFIG_ENTRIES = (
+PLAYER_CONFIG_ENTRIES: Final = (
     CONF_ENTRY_CROSSFADE_FLOW_MODE_REQUIRED,
     CONF_ENTRY_CROSSFADE_DURATION,
     CONF_ENTRY_OUTPUT_CODEC,
@@ -113,6 +112,7 @@ class DLNAPlayerProvider(PlayerProvider):  # pylint:disable=abstract-method
     _lock: Lock
     _upnp_factory: UpnpFactory
     _notify_handler: DLNANotifyHandler
+    _ssdp_listener: SSDPListener
 
     async def handle_async_init(self) -> None:
         """Handle async initialization of the provider."""
@@ -129,10 +129,16 @@ class DLNAPlayerProvider(PlayerProvider):  # pylint:disable=abstract-method
 
         self._upnp_factory = UpnpFactory(requester, non_strict=True)
         self._notify_handler = DLNANotifyHandler(self.mass, requester)
+        self._ssdp_listener = SSDPListener(
+            search_target=SSDP_ST_DMR,
+            session=self.mass.http_session,
+            async_callback=self._handle_ssdp_event,
+        )
 
     async def loaded_in_mass(self) -> None:
         """Call after the provider has been loaded."""
         self._notify_handler.register()
+        await self._ssdp_listener.async_start()
 
         await super().loaded_in_mass()
 
@@ -143,10 +149,12 @@ class DLNAPlayerProvider(PlayerProvider):  # pylint:disable=abstract-method
         Called when provider is deregistered (e.g. MA exiting or config reloading).
         """
         self._notify_handler.unregister()
+        await self._ssdp_listener.async_stop()
 
         async with TaskManager(self.mass) as tg:
             for dlna_player in self.dlna_players.values():
-                tg.create_task(dlna_player.async_disconnect())
+                if dlna_player.connected:
+                    tg.create_task(dlna_player.async_disconnect())
 
     async def get_player_config_entries(
         self,
@@ -252,103 +260,64 @@ class DLNAPlayerProvider(PlayerProvider):  # pylint:disable=abstract-method
         assert dlna_player.dmr_device is not None
         await dlna_player.dmr_device.async_mute_volume(muted)
 
-    async def poll_player(self, player_id: str) -> None:
-        """Poll player for state updates."""
-        dlna_player = self.dlna_players[player_id]
-
-        # # try to reconnect the device if the connection was lost
-        # if not dlna_player.dmr_device:
-        #     if not dlna_player.force_poll:
-        #         return
-        #     try:
-        #         await dlna_player.async_connect()
-        #     except UpnpError as err:
-        #         raise PlayerUnavailableError from err
-
-        assert dlna_player.dmr_device is not None
-
-        try:
-            now = time.time()
-            do_ping = dlna_player.force_poll or (now - dlna_player.last_seen) > 60
-            with suppress(ValueError):
-                await dlna_player.async_update(do_ping=do_ping)
-            dlna_player.last_seen = now if do_ping else dlna_player.last_seen
-        except UpnpError as err:
-            self.logger.debug("Device unavailable: %r", err)
-            await dlna_player.async_disconnect()
-            raise PlayerUnavailableError from err
-        finally:
-            dlna_player.force_poll = False
-
-    async def discover_players(self, use_multicast: bool = False) -> None:
+    async def discover_players(self) -> None:
         """Discover DLNA players on the network."""
         if self._discovery_running:
             return
+
         try:
             self._discovery_running = True
-            self.logger.debug("DLNA discovery started...")
-            discovered_devices: set[str] = set()
 
-            async def on_response(discovery_info: CaseInsensitiveDict) -> None:
-                """Process discovered device from ssdp search."""
-                ssdp_st: str = discovery_info.get("st", discovery_info.get("nt"))
-                if not ssdp_st:
-                    return
-
-                if "MediaRenderer" not in ssdp_st:
-                    # we're only interested in MediaRenderer devices
-                    return
-
-                ssdp_usn: str = discovery_info["usn"]
-                ssdp_udn: str | None = discovery_info.get("_udn")
-                if not ssdp_udn and ssdp_usn.startswith("uuid:"):
-                    ssdp_udn = ssdp_usn.split("::")[0]
-
-                if ssdp_udn in discovered_devices:
-                    # already processed this device
-                    return
-
-                if ssdp_udn:
-                    # ignore Sonos devices
-                    if "rincon" in ssdp_udn.lower():
-                        return
-
-                    discovered_devices.add(ssdp_udn)
-
-                    await self._device_discovered(ssdp_udn, discovery_info["location"])
-
-            await async_search(on_response)
-
+            await self._ssdp_listener.async_search()
         finally:
             self._discovery_running = False
 
         def reschedule() -> None:
-            self.mass.create_task(self.discover_players(use_multicast=not use_multicast))
+            self.mass.create_task(self.discover_players())
 
         # reschedule self once finished
-        self.mass.loop.call_later(300, reschedule)
+        self.mass.loop.call_later(600, reschedule)
 
-    async def _device_discovered(self, udn: str, location: str) -> None:
-        """Handle discovered DLNA player."""
-        async with self._lock:
-            if dlna_player := self.dlna_players.get(udn):
-                # existing player
-                await dlna_player.async_connect(location)
-            else:
-                # ignore disabled players
-                if self._is_player_disabled(udn):
-                    self.logger.debug("Ignoring disabled player: %s", udn)
-                    return
+    async def _handle_ssdp_event(
+        self,
+        ssdp_device: SsdpDevice,
+        device_or_service_type: DeviceOrServiceType,
+        _ssdp_source: SsdpSource,
+    ) -> None:
+        """Handle SSDP events."""
+        udn = ssdp_device.udn
 
-                # new player detected, setup our DLNAPlayer wrapper
-                self.dlna_players[udn] = DLNAPlayer(
-                    provider=self,
-                    udn=udn,
-                    upnp_factory=self._upnp_factory,
-                    event_handler=self._notify_handler.event_handler,
-                )
+        # Ignoring incompatible device
+        if device_or_service_type != SSDP_ST_DMR:
+            return
 
-            await self.dlna_players[udn].async_connect(location)
+        # ignore Sonos devices
+        if "rincon" in udn.lower():
+            self.logger.debug(f"Ignoring sonos device: {udn}")
+            return
+
+        # ignore disabled players
+        if self._is_player_disabled(udn):
+            self.logger.debug(f"Ignoring disabled player: {udn}")
+            return
+
+        if udn not in self.dlna_players:
+            # new player detected, setup our DLNAPlayer
+            self.dlna_players[udn] = DLNAPlayer(
+                provider=self,
+                udn=udn,
+                upnp_factory=self._upnp_factory,
+                event_handler=self._notify_handler.event_handler,
+            )
+
+        # prefer ipv4 if multiple locations available
+        location = get_preferred_location(ssdp_device.locations)
+
+        # get combined search and advertisement headers
+        headers = ssdp_device.combined_headers(device_or_service_type)
+
+        # connect the device
+        await self.dlna_players[udn].async_connect(location, headers)
 
     def _is_player_disabled(self, udn: str) -> bool:
         conf_key = f"{CONF_PLAYERS}/{udn}/enabled"
