@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 from async_upnp_client.exceptions import UpnpError, UpnpResponseError
 from async_upnp_client.profiles.dlna import DmrDevice, TransportState
 from music_assistant_models.enums import PlayerFeature, PlayerState, PlayerType
+from music_assistant_models.errors import PlayerUnavailableError
 from music_assistant_models.player import DeviceInfo, Player
 
 if TYPE_CHECKING:
@@ -89,7 +90,10 @@ class DLNAPlayer:
 
     @property
     def connected(self) -> bool:
-        """Device is connected when available and connected to the given location."""
+        """Device is connected when a DmrDevice exists.
+
+        Check self.available to see if the device is available.
+        """
         return self.dmr_device is not None
 
     @property
@@ -199,6 +203,8 @@ class DLNAPlayer:
                 # Device rejected subscription request. This is OK, variables
                 # will be polled instead.
                 self.logger.debug("Device rejected subscription: %r", err)
+
+                self._player.needs_poll = True
             except UpnpError as err:
                 # Don't leave the device half-constructed
                 if self.dmr_device:
@@ -259,6 +265,13 @@ class DLNAPlayer:
         self._update_attributes()
 
         self.provider.mass.players.update(self.id)
+
+    def get_device(self) -> DmrDevice:
+        """Get DMR device."""
+        if not self.available or self.dmr_device is None:
+            raise PlayerUnavailableError
+
+        return self.dmr_device
 
     def _handle_event(
         self,

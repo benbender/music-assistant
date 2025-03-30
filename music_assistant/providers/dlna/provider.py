@@ -11,11 +11,13 @@ from __future__ import annotations
 import functools
 import logging
 from asyncio import Lock
+from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Concatenate, Final, ParamSpec, TypeVar
 
 from async_upnp_client.aiohttp import AiohttpSessionRequester
 from async_upnp_client.client_factory import UpnpFactory
 from async_upnp_client.exceptions import UpnpError
+from music_assistant_models.errors import PlayerUnavailableError
 
 from music_assistant.constants import (
     CONF_ENTRY_CROSSFADE_DURATION,
@@ -40,6 +42,7 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Coroutine
 
     from async_upnp_client.const import DeviceOrServiceType, SsdpSource
+    from async_upnp_client.profiles.dlna import DmrDevice
     from async_upnp_client.ssdp_listener import SsdpDevice
     from music_assistant_models.config_entries import ConfigEntry, PlayerConfig
     from music_assistant_models.player import PlayerMedia
@@ -181,84 +184,79 @@ class DLNAPlayerProvider(PlayerProvider):  # pylint:disable=abstract-method
     @catch_request_errors
     async def cmd_stop(self, player_id: str) -> None:
         """Send STOP command to given player."""
-        dlna_player = self.dlna_players[player_id]
-        assert dlna_player.dmr_device is not None
-        await dlna_player.dmr_device.async_stop()
+        await self._get_dmr_device(player_id).async_stop()
 
     @catch_request_errors
     async def cmd_play(self, player_id: str) -> None:
         """Send PLAY command to given player."""
-        dlna_player = self.dlna_players[player_id]
-        assert dlna_player.dmr_device is not None
-        await dlna_player.dmr_device.async_play()
+        await self._get_dmr_device(player_id).async_play()
 
     @catch_request_errors
     async def play_media(self, player_id: str, media: PlayerMedia) -> None:
         """Handle PLAY MEDIA on given player."""
-        dlna_player = self.dlna_players[player_id]
-        assert dlna_player.dmr_device is not None
+        dmr_device = self._get_dmr_device(player_id)
 
         # always clear queue (by sending stop) first
-        if dlna_player.dmr_device.can_stop:
+        if dmr_device.can_stop:
             await self.cmd_stop(player_id)
+
         didl_metadata = create_didl_metadata(media)
         title = media.title or media.uri
-        await dlna_player.dmr_device.async_set_transport_uri(media.uri, title, didl_metadata)
-        # Play it
-        await dlna_player.dmr_device.async_wait_for_can_play(10)
+        await dmr_device.async_set_transport_uri(media.uri, title, didl_metadata)
 
-        await dlna_player.dmr_device.async_play()
+        # Play it
+        await dmr_device.async_wait_for_can_play(10)
+
+        await dmr_device.async_play()
 
     @catch_request_errors
     async def enqueue_next_media(self, player_id: str, media: PlayerMedia) -> None:
         """Handle enqueuing of the next queue item on the player."""
-        dlna_player = self.dlna_players[player_id]
-
-        assert dlna_player.dmr_device is not None
+        dmr_device = self._get_dmr_device(player_id)
 
         didl_metadata = create_didl_metadata(media)
         title = media.title or media.uri
         try:
-            await dlna_player.dmr_device.async_set_next_transport_uri(
-                media.uri, title, didl_metadata
-            )
+            await dmr_device.async_set_next_transport_uri(media.uri, title, didl_metadata)
         except UpnpError:
             self.logger.error(
                 "Enqueuing the next track failed for player %s - "
                 "the player probably doesn't support this. "
                 "Enable 'flow mode' for this player.",
-                dlna_player.name,
+                dmr_device.name,
             )
         else:
             self.logger.debug(
                 "Enqued next track (%s) to player %s",
                 title,
-                dlna_player.name,
+                dmr_device.name,
             )
 
     @catch_request_errors
     async def cmd_pause(self, player_id: str) -> None:
         """Send PAUSE command to given player."""
-        dlna_player = self.dlna_players[player_id]
-        assert dlna_player.dmr_device is not None
-        if dlna_player.dmr_device.can_pause:
-            await dlna_player.dmr_device.async_pause()
+        dmr_device = self._get_dmr_device(player_id)
+
+        if dmr_device.can_pause:
+            await dmr_device.async_pause()
         else:
-            await dlna_player.dmr_device.async_stop()
+            await dmr_device.async_stop()
 
     @catch_request_errors
     async def cmd_volume_set(self, player_id: str, volume_level: int) -> None:
         """Send VOLUME_SET command to given player."""
-        dlna_player = self.dlna_players[player_id]
-        assert dlna_player.dmr_device is not None
-        await dlna_player.dmr_device.async_set_volume_level(volume_level / 100)
+        await self._get_dmr_device(player_id).async_set_volume_level(volume_level / 100)
 
     @catch_request_errors
     async def cmd_volume_mute(self, player_id: str, muted: bool) -> None:
         """Send VOLUME MUTE command to given player."""
-        dlna_player = self.dlna_players[player_id]
-        assert dlna_player.dmr_device is not None
-        await dlna_player.dmr_device.async_mute_volume(muted)
+        await self._get_dmr_device(player_id).async_mute_volume(muted)
+
+    @catch_request_errors
+    async def cmd_seek(self, player_id: str, position: int) -> None:
+        """Handle SEEK command for given player."""
+        seek_time = timedelta(seconds=position)
+        await self._get_dmr_device(player_id).async_seek_abs_time(seek_time)
 
     async def discover_players(self) -> None:
         """Discover DLNA players on the network."""
@@ -287,7 +285,7 @@ class DLNAPlayerProvider(PlayerProvider):  # pylint:disable=abstract-method
         """Handle SSDP events."""
         udn = ssdp_device.udn
 
-        # Ignoring incompatible device
+        # Ignore incompatible device
         if device_or_service_type != SSDP_ST_DMR:
             return
 
@@ -323,3 +321,9 @@ class DLNAPlayerProvider(PlayerProvider):  # pylint:disable=abstract-method
         conf_key = f"{CONF_PLAYERS}/{udn}/enabled"
 
         return not self.mass.config.get(conf_key, True)
+
+    def _get_dmr_device(self, player_id: str) -> DmrDevice:
+        if player_id not in self.dlna_players:
+            raise PlayerUnavailableError
+
+        return self.dlna_players[player_id].get_device()
