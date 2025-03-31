@@ -8,11 +8,10 @@ All rights/credits reserved.
 
 from __future__ import annotations
 
-from asyncio import Lock, Task, create_task, sleep
-from collections.abc import Awaitable, Callable, Coroutine, Mapping  # pylint: disable=import-error
-from functools import wraps
+from asyncio import Lock, Task, sleep
+from collections.abc import Mapping  # pylint: disable=import-error
 from time import time
-from typing import TYPE_CHECKING, Any, ParamSpec
+from typing import TYPE_CHECKING, Any
 
 from async_upnp_client.exceptions import UpnpError, UpnpResponseError
 from async_upnp_client.profiles.dlna import DmrDevice, TransportState, split_commas
@@ -28,7 +27,7 @@ from music_assistant_models.player import DeviceInfo, Player, PlayerSource
 from .ssdp_listener import ATTR_SSDP_BOOTID, ATTR_SSDP_CONFIGID, ATTR_SSDP_LOCATION
 
 if TYPE_CHECKING:
-    from collections.abc import KwArg, Sequence, VarArg, _Wrapped
+    from collections.abc import Sequence
 
     from async_upnp_client.client import (  # type: ignore[attr-defined]
         UpnpEventHandler,
@@ -79,47 +78,6 @@ _TRANSPORT_STATE_TO_PLAYER_STATE: Mapping[TransportState, PlayerState] = {
 }
 
 
-P = ParamSpec("P")  # the callable parameters
-
-
-def debounce(wait: float) -> Callable[[Callable[P, Awaitable[Any]]], Callable[P, Awaitable[Any]]]:
-    """Decorato a func to debounce and throttle.
-
-    Debounce and throttle an async function for a given amount of time in seconds.
-
-    !!!Be aware that this wrapper might skip calls to the function if they occur too quickly!!!
-    """
-
-    def decorator(
-        func: Callable[P, Any],
-    ) -> _Wrapped[P, Any, [VarArg(Any), KwArg(Any)], Coroutine[Any, Any, None]]:
-        task: Task[Any] | None = None
-        last_run: float | None = None
-
-        @wraps(func)
-        async def throttle(*args: Any, **kwargs: Any) -> Task[Any] | None:
-            nonlocal task, last_run
-
-            # if a task already exists, cancel it
-            if task and not task.done():
-                return None
-
-            if last_run and (time() - last_run) > wait:
-                return None
-
-            # create a task which will run in {wait} time.
-            #
-            # needs to be saved to a var instead of being returned directly.
-            # otherwise the task is executed right away.
-            task = create_task(func(*args, **kwargs))
-
-            return task
-
-        return throttle
-
-    return decorator
-
-
 class DLNAPlayer:
     """Class that holds all dlna variables for a player."""
 
@@ -137,6 +95,10 @@ class DLNAPlayer:
 
     # Held when connecting or disconnecting the device
     _lock: Lock
+
+    # Update task
+    _last_update: float | None = None
+    _update_task: Task[Any] | None = None
 
     def __init__(
         self,
@@ -194,13 +156,20 @@ class DLNAPlayer:
     def available(self) -> bool:
         """Player availability.
 
-        Device is available when DLNA device is there and available.
+        Player is available when the DLNA device is created and available.
         """
-        return (
+        self._player.available = (
             self.connected
             and self.dmr_device is not None
             and self.dmr_device.profile_device.available
         )
+
+        return self._player.available
+
+    @property
+    def queue_playing(self) -> bool:
+        """Is playing a MA Queue."""
+        return bool(self._player.current_item_id and self.id in self._player.current_item_id)
 
     def get_device(self) -> DmrDevice:
         """Get the Digital Media Renderer device."""
@@ -214,7 +183,7 @@ class DLNAPlayer:
     ) -> None:
         """Connect to the DLNA/DMR Device.
 
-        Can always be called and will try to ensure a recent connection to the device.
+        Can always be called and will try to ensure a recent connection to the Device.
         We handle necessary reconnects and reinitialization internally.
 
         :param location: The description URL. Allowed to change within the lifetime of the device.
@@ -222,13 +191,13 @@ class DLNAPlayer:
         """
         async with self._lock:
             try:
-                self.logger.debug("Connecting to device at %s", location)
+                self.logger.info(f"Connect to Player at {location}")
 
                 do_reinit = False
 
                 # handle first connect
                 if self.dmr_device is None:
-                    self.logger.debug("First connect, creating dmr device")
+                    self.logger.debug("First connect, create DMR Device")
 
                     # Connect to the base UPNP device
                     self.dmr_device = await self._async_create_device(location)
@@ -272,41 +241,29 @@ class DLNAPlayer:
                     do_reinit = True
 
                 if do_reinit:
-                    if headers:
-                        await self._async_reinit_device(location, headers)
-                    else:
-                        # this is only needed when the connect is triggered manually
-                        # without providing headers
-                        self.dmr_device = await self._async_create_device(location)
+                    await self._async_reinit_device(location, headers)
+
+                self._player.powered = True
 
                 # Subscribe to event notifications
                 self.dmr_device.on_event = self._handle_upnp_event
 
-                # connect was successful, update device info
-                self._player.device_info = DeviceInfo(
-                    ip_address=self.dmr_device.profile_device.device_url or location,
-                    manufacturer=self.dmr_device.manufacturer,
-                    model=self.dmr_device.model_name,
-                    model_id=self.dmr_device.model_number.strip()
-                    if self.dmr_device.model_number
-                    else None,
-                )
-                self._player.powered = True
-                self.dmr_device.profile_device.available = True
-
                 # subscribe to DLNA-events. Automatically resubscribes if already subscribed.
                 await self.dmr_device.async_subscribe_services(auto_resubscribe=True)
 
-                self._update_supported_features()
+                # needs to be called before registering the player to get the correct
+                # features set
+                self._update_player()
 
                 await self.provider.mass.players.register_or_update(self._player)
 
             except UpnpResponseError as err:
                 # Device rejected subscription request. This is OK, variables
                 # will be polled instead.
+                # TODO handle correctly
                 self.logger.debug("Device rejected subscription: %r", err)
 
-                self._player.needs_poll = True
+                # self._player.needs_poll = True
             except UpnpError as err:
                 # Don't leave the device half-constructed
                 if self.dmr_device:
@@ -326,10 +283,10 @@ class DLNAPlayer:
             self._player.available = False
 
             if not self.dmr_device:
-                self.logger.debug("Disconnecting from device that's not connected")
+                self.logger.debug("Disconnect from device that's not connected")
                 return
 
-            self.logger.debug("Disconnecting from %s", self.dmr_device.name)
+            self.logger.debug("Disconnect from %s", self.dmr_device.name)
 
             self.dmr_device.on_event = None
             old_device = self.dmr_device
@@ -338,21 +295,34 @@ class DLNAPlayer:
 
             self.provider.mass.players.update(self.id)
 
-    @debounce(1)
-    async def async_update(self, do_ping: bool = False) -> None:
-        """Retrieve the latest data from the player.
+    def update(self, do_ping: bool = False) -> None:
+        """Create a queued task to poll the latest data from the Player.
 
         :param do_ping: Poll device to check if it is available (online).
 
         This will be called after retrieving events from the DLNA device.
         Those events can occur in quick succession and therefore this method
         is debounced and will run once every second at most.
+        """
+        # If a task already exists, skip
+        if self._update_task and not self._update_task.done():
+            return
 
+        # If a last task ran less than a second ago, skip
+        if self._last_update and (time() - self._last_update) > 1:
+            return
 
+        # Create task
+        self._update_task = self.provider.mass.loop.create_task(self._async_update(do_ping))
+
+    async def _async_update(self, do_ping: bool = False) -> None:
+        """Retrieve the latest data from the DMR Device and update the MASS Player.
+
+        :param do_ping: Poll device to check if it is available (online).
         """
         assert self.dmr_device is not None
 
-        self.logger.info("polling player")
+        self.logger.debug(f"Update Player {self.name}")
 
         try:
             # Poll the player for unevented vars
@@ -362,20 +332,24 @@ class DLNAPlayer:
             await self.async_disconnect()
             return
 
-        # Wait for events to arrive
+        # Wait for DLNA events to arrive
         await sleep(1)
 
-        prev_url = self._player.current_item_id
-        prev_state = self._player.state
-        self._update_attributes()
-        current_url = self._player.current_item_id
-        current_state = self._player.state
+        self._update_media()
 
-        if (prev_url != current_url) or (prev_state != current_state):
-            # fetch track details on state or url change
-            self.logger.info("media item changed…")
+        if self._player.state == PlayerState.PLAYING and self._player.needs_poll is False:
+            # Not every action produces events per DLNA spec.
+            # Therefore we poll every few seconds additionally.
+            # This also acts as kind of a stopgap against broken client implementations.
+            self._player.needs_poll = True
+            self._player.poll_interval = 3
 
-        self.logger.debug("write player state")
+            self.logger.debug(f"Start timed polling for Player {self.name}.")
+        elif self._player.state != PlayerState.PLAYING and self._player.needs_poll:
+            self._player.needs_poll = False
+            self._player.poll_interval = 30
+
+            self.logger.debug(f"Stop timed polling for Player {self.name}.")
 
         # inform MA off changes and write the player state
         self.provider.mass.players.update(self.id)
@@ -417,7 +391,7 @@ class DLNAPlayer:
                 elif state_variable.name == "PlaybackStorageMedium":
                     active_source = None
 
-                    if self._is_mass_stream():
+                    if self.queue_playing:
                         active_source = self.id
 
                     elif state_variable.value:
@@ -425,7 +399,7 @@ class DLNAPlayer:
 
                         active_source = state_variable.value.lower()
 
-                        if active_source in ("unknown", "none", "un_known", ""):
+                        if active_source in ("none", "unknown", "un_known", ""):
                             active_source = None
 
                         if active_source:
@@ -444,102 +418,75 @@ class DLNAPlayer:
 
                     self._player.active_source = active_source
 
-                if state_variable.name == "TransportState":
-                    self.logger.debug(
-                        "Received new transport state for Player %s: %s",
-                        self.name,
-                        state_variable.value,
-                    )
+        self.update()
 
-                    if state_variable.value == TransportState.PLAYING:
-                        # Because not every action produces events per DLNA spec,
-                        # additionally we poll for changes every few seconds.
-                        self._player.needs_poll = True
-                        self._player.poll_interval = 3
-
-                        self.logger.debug("Start timed polling.")
-                    else:
-                        self._player.needs_poll = False
-                        self._player.poll_interval = 30
-
-                        self.logger.debug("Stop timed polling.")
-
-                        if self.dmr_device.transport_state in (
-                            TransportState.STOPPED,
-                            TransportState.TRANSITIONING,
-                        ):
-                            self._player.elapsed_time = None
-                            self._player.elapsed_time_last_updated = None
-
-        self.provider.mass.create_task(self.async_update())
-
-    def _update_attributes(self) -> None:
+    def _update_media(self) -> None:
         """Update attributes of the MA Player from DLNA state."""
         assert self.dmr_device is not None
 
-        # generic attributes
-        if self.available:
-            self._player.available = True
-            self._player.name = self.dmr_device.name
-            self._player.volume_level = int((self.dmr_device.volume_level or 0) * 100)
-            self._player.volume_muted = self.dmr_device.is_volume_muted or False
-            self._player.state = _TRANSPORT_STATE_TO_PLAYER_STATE[
-                self.dmr_device.transport_state or TransportState.STOPPED
-            ]
-            self._player.current_item_id = self.dmr_device.current_track_uri or ""
+        prev_url = self._player.current_item_id
+        prev_state = self._player.state
 
-            # set active source
+        # Update player state
+        self._player.state = _TRANSPORT_STATE_TO_PLAYER_STATE[
+            self.dmr_device.transport_state or TransportState.STOPPED
+        ]
 
-            if self.id in self._player.current_item_id:
-                self._player.active_source = self.id
-            else:
-                # sync the received metadata of the currently played media to MA.
-                self._player.set_current_media(
-                    uri=self.dmr_device.current_track_uri or "",
-                    media_type=_MEDIA_TYPE_MAP.get(self.dmr_device.media_class or "object")
-                    or MediaType.UNKNOWN,
-                    title=self.dmr_device.media_title,
-                    artist=self.dmr_device.media_artist,
-                    album=self.dmr_device.media_album_name,
-                    image_url=self.dmr_device.media_image_url,
-                    duration=self.dmr_device.media_duration,
-                )
+        # Update volume
+        self._player.volume_level = int((self.dmr_device.volume_level or 0) * 100)
+        self._player.volume_muted = self.dmr_device.is_volume_muted or False
 
+        # Update media
+        self._player.current_item_id = self.dmr_device.current_track_uri or ""
+
+        if self.queue_playing:
+            self._player.active_source = self.id
+        else:
+            # We are playing from an external source.
+            # Sync currently played media to MA.
+            self._player.set_current_media(
+                uri=self.dmr_device.current_track_uri or "",
+                media_type=_MEDIA_TYPE_MAP.get(self.dmr_device.media_class or "object")
+                or MediaType.UNKNOWN,
+                title=self.dmr_device.media_title,
+                artist=self.dmr_device.media_artist,
+                album=self.dmr_device.media_album_name,
+                image_url=self.dmr_device.media_image_url,
+                duration=self.dmr_device.media_duration,
+            )
+
+            # Set elapsed time
             self._player.elapsed_time = (
                 float(self.dmr_device.media_position)
                 if self.dmr_device.media_position is not None
                 else None
             )
 
-            # we need to convert the utc-datetime DLNA uses to the
-            # local timezone MA is expecting. After that, we convert it to
             self._player.elapsed_time_last_updated = (
                 (self.dmr_device.media_position_updated_at.timestamp())
                 if self.dmr_device.media_position_updated_at is not None
                 else None
             )
 
-            self.logger.warning(
-                f"DLNA {self.dmr_device.media_position} {
-                    self.dmr_device.media_position_updated_at.timestamp()
-                    if self.dmr_device.media_position_updated_at is not None
-                    else None
-                }"
-            )
+        if prev_state != self._player.state:
+            self.logger.debug(f"State of Player {self.name} changed: {self._player.state}")
 
-            self.logger.warning(
-                f"MASS {self._player.elapsed_time} {self._player.elapsed_time_last_updated}"
-            )
+        if prev_url != self._player.current_item_id:
+            self.logger.debug(f"Media of Player {self.name} changed: {self._player.current_media}")
 
-            self._update_supported_features()
-        else:
-            # device is unavailable
-            self._player.available = False
-
-    def _update_supported_features(self) -> None:
+    def _update_player(self) -> None:
         """Set Player Features based on config values and capabilities."""
         if not self.dmr_device:
             return
+
+        self._player.available = self.dmr_device.profile_device.available
+        self._player.name = self.dmr_device.name
+        self._player.device_info = DeviceInfo(
+            ip_address=self.dmr_device.profile_device.device_url,
+            manufacturer=self.dmr_device.manufacturer,
+            model=self.dmr_device.model_name,
+            model_id=self.dmr_device.model_number.strip() if self.dmr_device.model_number else None,
+        )
 
         # Update supported features
         supported_features = set[PlayerFeature]()
@@ -566,22 +513,28 @@ class DLNAPlayer:
         services for the DMR profile. If those are not found, an error is raised and the player
         is deleted by the provider.
         """
-        # Connect to the base UPNP device
+        # If we are connected, disconnect the device first.
+        if self.connected:
+            await self.async_disconnect()
+
+        # Connect to the base UPNP device.
         upnp_device = await self._upnp_factory.async_create_device(location)
 
-        # Check if the device is a DMR-profile device.
-        # We are doing this here and this late to avoid fetching and parsing the
-        # description.xml twice.
+        # Check if the DLNA Device confirms to the DMR profile.
+        # We are doing this here and this late to avoid fetching and parsing
+        # the description.xml twice.
         if not DmrDevice.is_profile_device(upnp_device):
             self.provider.mass.players.remove(self.id)
 
-            # will be caught by the provider which will delete the device.
+            # Will be caught by the provider which will delete the device.
             raise RuntimeError(f"Found incompatible device, removing: {upnp_device.device_type}")
 
         # Create profile wrapper
         return DmrDevice(upnp_device, self._event_handler)
 
-    async def _async_reinit_device(self, location: str, ssdp_headers: CaseInsensitiveDict) -> None:
+    async def _async_reinit_device(
+        self, location: str, ssdp_headers: CaseInsensitiveDict | None = None
+    ) -> None:
         """Reinitialize the device.
 
         Reinitialize on reboots and config changes. This is signaled via SSDP and needed because,
@@ -593,7 +546,6 @@ class DLNAPlayer:
 
         new_device = await self._upnp_factory.async_create_device(location)
         self.dmr_device.profile_device.reinit(new_device)
-        self.dmr_device.profile_device.ssdp_headers = ssdp_headers
 
-    def _is_mass_stream(self) -> bool:
-        return bool(self._player.current_item_id and self.id in self._player.current_item_id)
+        if ssdp_headers:
+            self.dmr_device.profile_device.ssdp_headers = ssdp_headers

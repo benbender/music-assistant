@@ -175,7 +175,7 @@ class DLNAPlayerProvider(PlayerProvider):  # pylint:disable=abstract-method
         """Call (by config manager) when the configuration of a player changes."""
         if dlna_player := self.dlna_players.get(config.player_id):
             # reset player features based on config values
-            await dlna_player.async_update()
+            dlna_player.update()
         else:
             # run discovery to catch any re-enabled players
             self.mass.create_task(self.discover_players())
@@ -288,11 +288,11 @@ class DLNAPlayerProvider(PlayerProvider):  # pylint:disable=abstract-method
         """Handle SSDP events."""
         udn = ssdp_device.udn
 
-        # Ignore incompatible device
+        # Ignore incompatible players
         if device_or_service_type != SSDP_ST_DMR:
             return
 
-        # ignore Sonos devices
+        # ignore Sonos players
         if "rincon" in udn.lower():
             self.logger.debug(f"Ignoring sonos device: {udn}")
             return
@@ -303,7 +303,7 @@ class DLNAPlayerProvider(PlayerProvider):  # pylint:disable=abstract-method
             return
 
         if udn not in self.dlna_players:
-            # new player detected, setup our DLNAPlayer
+            # new player detected, setup DLNAPlayer
             self.dlna_players[udn] = DLNAPlayer(
                 provider=self,
                 udn=udn,
