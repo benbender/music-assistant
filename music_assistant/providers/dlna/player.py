@@ -98,9 +98,9 @@ class DLNAPlayer:
     # Held when connecting or disconnecting the device
     _lock: Lock
 
-    # Update task
-    _last_update: float | None = None
-    _update_task: Task[Any] | None = None
+    # Update media task
+    _last_media_update: float | None = None
+    _update_media_task: Task[Any] | None = None
 
     def __init__(
         self,
@@ -286,6 +286,9 @@ class DLNAPlayer:
         async with self._lock:
             self._player.available = False
 
+            if self._update_media_task and not self._update_media_task.done():
+                self._update_media_task.cancel()
+
             if not self.dmr_device:
                 self.logger.debug("Disconnect from device that's not connected")
                 return
@@ -372,22 +375,27 @@ class DLNAPlayer:
         is debounced and throttled. It will run once per second at most.
         """
         # If a task already exists, skip
-        if self._update_task and not self._update_task.done():
+        if self._update_media_task and not self._update_media_task.done():
             return
 
         # If a last task ran less than a second ago, skip
-        if self._last_update and (time() - self._last_update) > 1:
+        if self._last_media_update and (time() - self._last_media_update) < 1:
             return
 
-        # Create task
-        self._update_task = self.provider.mass.loop.create_task(self._async_update(do_ping))
+        self._update_media_task = self.provider.mass.loop.create_task(self._async_update(do_ping))
+
+        self._last_media_update = time()
 
     async def _async_update(self, do_ping: bool = False) -> None:
         """Retrieve the latest data from the DMR Device and update the MASS Player.
 
         :param do_ping: Poll device to check if it is available (online).
+
+        This method is internal as we provide a facade to debounce and throttle those calls.
         """
         assert self.dmr_device is not None
+
+        self.logger.debug(f"Update player {self.name}")
 
         try:
             # Poll the player for unevented vars
@@ -421,32 +429,8 @@ class DLNAPlayer:
         # inform MA of changes and write the player state
         self.provider.mass.players.update(self.id)
 
-    def _handle_upnp_event(
-        self,
-        _service: UpnpService,
-        state_variables: Sequence[UpnpStateVariable[Any]],
-    ) -> None:
-        """Handle state variable(s) changed event from DLNA device.
-
-        This method also triggers a debounced update to the player state.
-
-        :param service: The UpnpService that produced the event.
-        :param state_variables: Variables that changed within the event.
-        """
-        if not state_variables:
-            # TODO handle subscription-failures properly
-            # Indicates a failure to resubscribe, check if device is still available
-            # self.check_available = True
-            return
-
-        # Call for an update if an event arrived
-        self.update_media()
-
     def _update_media(self) -> None:
-        """Update attributes of the MA Player from DLNA state.
-
-        This method is internal as we provide a facade to debounce and throttle those calls.
-        """
+        """Update attributes of the MA Player from DLNA state."""
         assert self.dmr_device is not None
 
         prev_url = self._player.current_item_id
@@ -536,6 +520,27 @@ class DLNAPlayer:
 
         if prev_url != self._player.current_item_id:
             self.logger.debug(f"Media of Player {self.name} changed: {self._player.current_media}")
+
+    def _handle_upnp_event(
+        self,
+        _service: UpnpService,
+        state_variables: Sequence[UpnpStateVariable[Any]],
+    ) -> None:
+        """Handle state variable(s) changed event from DLNA device.
+
+        This method also triggers a debounced update to the player state.
+
+        :param service: The UpnpService that produced the event.
+        :param state_variables: Variables that changed within the event.
+        """
+        if not state_variables:
+            # TODO handle subscription-failures properly
+            # Indicates a failure to resubscribe, check if device is still available
+            # self.check_available = True
+            return
+
+        # Call for an update if an event arrived
+        self.update_media()
 
     async def _async_create_device(self, location: str) -> DmrDevice:
         """Create the device.

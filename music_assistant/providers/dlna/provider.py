@@ -9,7 +9,7 @@ All rights/credits reserved.
 from __future__ import annotations
 
 import logging
-from asyncio import Lock
+from asyncio import Lock, Task
 from datetime import timedelta
 from functools import wraps
 from typing import TYPE_CHECKING, Any, Concatenate, Final, ParamSpec, TypeVar
@@ -105,6 +105,9 @@ class DLNAPlayerProvider(PlayerProvider):  # pylint:disable=abstract-method
     _notify_handler: DLNANotifyHandler
     _ssdp_listener: SSDPListener
 
+    _discover_freq = 600
+    _discover_task: Task[Any] | None = None
+
     async def handle_async_init(self) -> None:
         """Handle async initialization of the provider."""
         self.dlna_players = {}
@@ -139,6 +142,9 @@ class DLNAPlayerProvider(PlayerProvider):  # pylint:disable=abstract-method
 
         Called when provider is deregistered (e.g. MA exiting or config reloading).
         """
+        if self._discover_task and not self._discover_task.done():
+            self._discover_task.cancel()
+
         self._notify_handler.unregister()
         await self._ssdp_listener.async_stop()
 
@@ -175,10 +181,10 @@ class DLNAPlayerProvider(PlayerProvider):  # pylint:disable=abstract-method
         """Call (by config manager) when the configuration of a player changes."""
         if dlna_player := self.dlna_players.get(config.player_id):
             # reset player features based on config values
-            dlna_player.update_player()
+            await dlna_player.update_player()
         else:
             # run discovery to catch any re-enabled players
-            self.mass.create_task(self.discover_players())
+            self._discover_task = self.mass.create_task(self.discover_players())
 
     async def poll_player(self, player_id: str) -> None:
         """Poll player for state updates."""
@@ -273,11 +279,8 @@ class DLNAPlayerProvider(PlayerProvider):  # pylint:disable=abstract-method
         finally:
             self._discovery_running = False
 
-        def reschedule() -> None:
-            self.mass.create_task(self.discover_players())
-
         # reschedule self once finished
-        self.mass.loop.call_later(600, reschedule)
+        self.mass.loop.call_later(self._discover_freq, self.discover_players)
 
     async def _handle_ssdp_event(
         self,
