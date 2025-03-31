@@ -14,7 +14,11 @@ from time import time
 from typing import TYPE_CHECKING, Any
 
 from async_upnp_client.exceptions import UpnpError, UpnpResponseError
-from async_upnp_client.profiles.dlna import DmrDevice, TransportState, split_commas
+from async_upnp_client.profiles.dlna import (
+    DmrDevice,
+    TransportState,
+    _lower_split_commas,
+)
 from music_assistant_models.enums import (
     MediaType,
     PlayerFeature,
@@ -85,10 +89,8 @@ class DLNAPlayer:
     dmr_device: DmrDevice | None = None
 
     # Signals if this device supports FLAC.
-    # We proactively assume it does because because we can only
-    # check it correctly at runtime.
-    # At least as "correctly" as those many broken DLNA-clients out there are…
-    supports_flac: bool = True
+    # The actual support will be derived by the devices capabilities on runtime.
+    supports_flac: bool = False
 
     # Music Assistant Player instance
     _player: Player
@@ -253,9 +255,11 @@ class DLNAPlayer:
 
                 # needs to be called before registering the player to get the correct
                 # features set
-                self._update_player()
+                await self.update_player()
 
                 await self.provider.mass.players.register_or_update(self._player)
+
+                self.update_media()
 
             except UpnpResponseError as err:
                 # Device rejected subscription request. This is OK, variables
@@ -295,14 +299,77 @@ class DLNAPlayer:
 
             self.provider.mass.players.update(self.id)
 
-    def update(self, do_ping: bool = False) -> None:
+    async def update_player(self) -> None:
+        """Update the Player features and capabilities."""
+        if not self.dmr_device:
+            return
+
+        # Update basic info
+        self._player.available = self.dmr_device.profile_device.available
+        self._player.name = self.dmr_device.name
+        self._player.device_info = DeviceInfo(
+            ip_address=self.dmr_device.profile_device.device_url,
+            manufacturer=self.dmr_device.manufacturer,
+            model=self.dmr_device.model_name,
+            model_id=self.dmr_device.model_number.strip() if self.dmr_device.model_number else None,
+        )
+
+        # Update supported features
+        supported_features = set[PlayerFeature]()
+
+        if self.dmr_device.has_next_transport_uri:
+            supported_features.add(PlayerFeature.ENQUEUE)
+        if self.dmr_device.has_volume_level:
+            supported_features.add(PlayerFeature.VOLUME_SET)
+        if self.dmr_device.has_volume_mute:
+            supported_features.add(PlayerFeature.VOLUME_MUTE)
+        if self.dmr_device.has_pause:
+            supported_features.add(PlayerFeature.PAUSE)
+        if self.dmr_device.has_seek_abs_time:
+            supported_features.add(PlayerFeature.SEEK)
+        if self.dmr_device.has_next and self.dmr_device.has_previous:
+            supported_features.add(PlayerFeature.NEXT_PREVIOUS)
+
+        self._player.supported_features = supported_features
+
+        # Determine if the Device supports FLAC
+        protocol_info = await self.dmr_device.async_get_protocol_info()
+
+        for item in protocol_info["sink"]:
+            if "audio/flac" in item:
+                self.supports_flac = True
+                self.logger.debug(f"Player {self.name} supports flac")
+                break
+        else:
+            self.logger.debug(f"Player {self.name} does not support flac")
+
+        # Dynamically create sources provided by the player
+        if self._possible_sources:
+            self._player.source_list.clear()
+
+            for source in self._possible_sources:
+                if source in ("none", "unknown", "un_known", ""):
+                    continue
+
+                self._player.source_list.append(
+                    PlayerSource(
+                        id=source.lower(),
+                        name=source.title(),
+                        passive=True,
+                        can_play_pause=False,
+                        can_next_previous=False,
+                        can_seek=False,
+                    )
+                )
+
+    def update_media(self, do_ping: bool = False) -> None:
         """Create a queued task to poll the latest data from the Player.
 
         :param do_ping: Poll device to check if it is available (online).
 
         This will be called after retrieving events from the DLNA device.
         Those events can occur in quick succession and therefore this method
-        is debounced and will run once every second at most.
+        is debounced and throttled. It will run once per second at most.
         """
         # If a task already exists, skip
         if self._update_task and not self._update_task.done():
@@ -322,8 +389,6 @@ class DLNAPlayer:
         """
         assert self.dmr_device is not None
 
-        self.logger.debug(f"Update Player {self.name}")
-
         try:
             # Poll the player for unevented vars
             await self.dmr_device.async_update(do_ping=do_ping)
@@ -337,8 +402,10 @@ class DLNAPlayer:
 
         self._update_media()
 
+        # Dynamically determine if we need to poll the Device additionally
         if self._player.state == PlayerState.PLAYING and self._player.needs_poll is False:
             # Not every action produces events per DLNA spec.
+            #
             # Therefore we poll every few seconds additionally.
             # This also acts as kind of a stopgap against broken client implementations.
             self._player.needs_poll = True
@@ -351,12 +418,12 @@ class DLNAPlayer:
 
             self.logger.debug(f"Stop timed polling for Player {self.name}.")
 
-        # inform MA off changes and write the player state
+        # inform MA of changes and write the player state
         self.provider.mass.players.update(self.id)
 
     def _handle_upnp_event(
         self,
-        service: UpnpService,
+        _service: UpnpService,
         state_variables: Sequence[UpnpStateVariable[Any]],
     ) -> None:
         """Handle state variable(s) changed event from DLNA device.
@@ -372,56 +439,14 @@ class DLNAPlayer:
             # self.check_available = True
             return
 
-        assert self.dmr_device is not None
-
-        if service.service_id == "urn:upnp-org:serviceId:AVTransport":
-            for state_variable in state_variables:
-                if state_variable.name == "SinkProtocolInfo":
-                    # Does this device support flac?
-                    self.supports_flac = False
-
-                    for item in split_commas(state_variable.value):
-                        if "audio/flac" in item.lower():
-                            self.supports_flac = True
-                            self.logger.debug("Player supports flac")
-                            break
-                    else:
-                        self.logger.debug("Player does not support flac")
-
-                elif state_variable.name == "PlaybackStorageMedium":
-                    active_source = None
-
-                    if self.queue_playing:
-                        active_source = self.id
-
-                    elif state_variable.value:
-                        self._player.source_list.clear()
-
-                        active_source = state_variable.value.lower()
-
-                        if active_source in ("none", "unknown", "un_known", ""):
-                            active_source = None
-
-                        if active_source:
-                            self._player.source_list.append(
-                                PlayerSource(
-                                    id=active_source.lower(),
-                                    name=active_source.title(),
-                                    passive=True,
-                                    can_play_pause=self.dmr_device.can_pause
-                                    and self.dmr_device.can_play,
-                                    can_next_previous=self.dmr_device.can_pause
-                                    and self.dmr_device.can_play,
-                                    can_seek=self.dmr_device.can_seek_abs_time,
-                                )
-                            )
-
-                    self._player.active_source = active_source
-
-        self.update()
+        # Call for an update if an event arrived
+        self.update_media()
 
     def _update_media(self) -> None:
-        """Update attributes of the MA Player from DLNA state."""
+        """Update attributes of the MA Player from DLNA state.
+
+        This method is internal as we provide a facade to debounce and throttle those calls.
+        """
         assert self.dmr_device is not None
 
         prev_url = self._player.current_item_id
@@ -439,11 +464,49 @@ class DLNAPlayer:
         # Update media
         self._player.current_item_id = self.dmr_device.current_track_uri or ""
 
+        # Update active source
         if self.queue_playing:
+            # We are playing the MA queue
             self._player.active_source = self.id
         else:
-            # We are playing from an external source.
-            # Sync currently played media to MA.
+            # We are playing from an external source
+            if self._active_source:
+                self._player.active_source = self._active_source
+
+                # Find source in the players source_list to update it dynamically.
+                # If we found an item, update its capabilities
+                if active_source_item := next(
+                    (
+                        source
+                        for source in self._player.source_list
+                        if source.id == self._active_source
+                    ),
+                    None,
+                ):
+                    active_source_item.can_play_pause = (
+                        self.dmr_device.can_pause and self.dmr_device.can_play
+                    )
+                    active_source_item.can_next_previous = (
+                        self.dmr_device.can_pause and self.dmr_device.can_play
+                    )
+                    active_source_item.can_seek = self.dmr_device.can_seek_abs_time
+                else:
+                    # If we did not find one, create it
+                    self._player.source_list.append(
+                        PlayerSource(
+                            id=self._active_source,
+                            name=self._active_source.title(),
+                            passive=True,
+                            can_play_pause=self.dmr_device.can_pause and self.dmr_device.can_play,
+                            can_next_previous=self.dmr_device.can_pause
+                            and self.dmr_device.can_play,
+                            can_seek=self.dmr_device.can_seek_abs_time,
+                        )
+                    )
+            else:
+                self._player.active_source = None
+
+            # As we are playing from an external source, sync currently played media to MASS.
             self._player.set_current_media(
                 uri=self.dmr_device.current_track_uri or "",
                 media_type=_MEDIA_TYPE_MAP.get(self.dmr_device.media_class or "object")
@@ -473,38 +536,6 @@ class DLNAPlayer:
 
         if prev_url != self._player.current_item_id:
             self.logger.debug(f"Media of Player {self.name} changed: {self._player.current_media}")
-
-    def _update_player(self) -> None:
-        """Set Player Features based on config values and capabilities."""
-        if not self.dmr_device:
-            return
-
-        self._player.available = self.dmr_device.profile_device.available
-        self._player.name = self.dmr_device.name
-        self._player.device_info = DeviceInfo(
-            ip_address=self.dmr_device.profile_device.device_url,
-            manufacturer=self.dmr_device.manufacturer,
-            model=self.dmr_device.model_name,
-            model_id=self.dmr_device.model_number.strip() if self.dmr_device.model_number else None,
-        )
-
-        # Update supported features
-        supported_features = set[PlayerFeature]()
-
-        if self.dmr_device.has_next_transport_uri:
-            supported_features.add(PlayerFeature.ENQUEUE)
-        if self.dmr_device.has_volume_level:
-            supported_features.add(PlayerFeature.VOLUME_SET)
-        if self.dmr_device.has_volume_mute:
-            supported_features.add(PlayerFeature.VOLUME_MUTE)
-        if self.dmr_device.has_pause:
-            supported_features.add(PlayerFeature.PAUSE)
-        if self.dmr_device.has_seek_abs_time:
-            supported_features.add(PlayerFeature.SEEK)
-        if self.dmr_device.has_next and self.dmr_device.has_previous:
-            supported_features.add(PlayerFeature.NEXT_PREVIOUS)
-
-        self._player.supported_features = supported_features
 
     async def _async_create_device(self, location: str) -> DmrDevice:
         """Create the device.
@@ -549,3 +580,19 @@ class DLNAPlayer:
 
         if ssdp_headers:
             self.dmr_device.profile_device.ssdp_headers = ssdp_headers
+
+    @property
+    def _possible_sources(self) -> set[str] | None:
+        state_var = self.get_device()._state_variable("AVT", "PossiblePlaybackStorageMedia")  # pylint: disable=protected-access
+        if not state_var:
+            return None
+
+        return _lower_split_commas(state_var.value or "")
+
+    @property
+    def _active_source(self) -> str | None:
+        state_var = self.get_device()._state_variable("AVT", "PlaybackStorageMedium")  # pylint: disable=protected-access
+        if not state_var or not isinstance(state_var.value, str):
+            return None
+
+        return state_var.value.strip().lower()

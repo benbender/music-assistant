@@ -175,7 +175,7 @@ class DLNAPlayerProvider(PlayerProvider):  # pylint:disable=abstract-method
         """Call (by config manager) when the configuration of a player changes."""
         if dlna_player := self.dlna_players.get(config.player_id):
             # reset player features based on config values
-            dlna_player.update()
+            dlna_player.update_player()
         else:
             # run discovery to catch any re-enabled players
             self.mass.create_task(self.discover_players())
